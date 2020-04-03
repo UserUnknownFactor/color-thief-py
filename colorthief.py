@@ -5,15 +5,13 @@
 
     Grabbing the color palette from an image.
 
-    :copyright: (c) 2015 by Shipeng Feng.
+    :copyright: (c) 2020 by Shipeng Feng and others.
     :license: BSD, see LICENSE for more details.
 """
-__version__ = '0.2.1'
+__version__ = '0.3.0'
 
-import math
-
+import math, io
 from PIL import Image
-
 
 class cached_property(object):
     """Decorator that creates converts a method with a single
@@ -26,31 +24,93 @@ class cached_property(object):
         res = instance.__dict__[self.func.__name__] = self.func(instance)
         return res
 
-
 class ColorThief(object):
     """Color thief main class."""
-    def __init__(self, file):
+    
+    white_threshold = 0xF0 # If pixel is almost white
+    black_threshold = 0x0F # If pixel is almost black
+    alpha_threshold = 100 # If pixel is kind of opaque
+    
+    def __init__(self, input_stream, default_color=None):
         """Create one color thief for one image.
 
-        :param file: A filename (string) or a file object. The file object
-                     must implement `read()`, `seek()`, and `tell()` methods,
-                     and be opened in binary mode.
+        :param input_stream: A filename (string) or a file object or Image or raw RGBA pixel list.
+        :param default_color: color to use if no matches found: (0xFF,0xFF,0xFF), None, etc.
         """
-        self.image = Image.open(file)
+        self.image = None
+        self.pixels = None
+        self.cmap = None
+        self.default_color = default_color
+        if (isinstance(input_stream, str) or isinstance(input_stream, io.BufferedIOBase) or
+            isinstance(input_stream, io.RawIOBase) or isinstance(input_stream, io.IOBase)):
+            self.image = Image.open(input_stream)
+        elif isinstance(input_stream, Image.Image):
+            self.image = input_stream
+        elif isinstance(input_stream, list):
+             self.pixels = input_stream
+        else:
+            raise "Not an image-like parameter"
 
-    def get_color(self, quality=10):
+    @staticmethod
+    def hex_to_rgb(hex):
+        return tuple(bytes.fromhex(hex.replace("#", ''))[:3])
+
+    @staticmethod
+    def rgb_to_hex(r, g, b):
+        return '#{:02X}{:02X}{:02X}'.format(r, g, b)
+
+    @staticmethod
+    def pix_to_hex(pix):
+        return ColorThief.rgb_to_hex(pix[0], pix[1], pix[2])
+
+    @staticmethod
+    def hilo(a, b, c):
+        if c < b: b, c = c, b
+        if b < a: a, b = b, a
+        if c < b: b, c = c, b
+        return a + c
+
+    @staticmethod
+    def is_white(r, g, b):
+        return (r > ColorThief.white_threshold and
+                g > ColorThief.white_threshold and
+                b > ColorThief.white_threshold)
+
+    @staticmethod
+    def is_black(r, g, b):
+        return (r < ColorThief.black_threshold and
+                g < ColorThief.black_threshold and
+                b < ColorThief.black_threshold)
+
+    @staticmethod
+    def complement(r, g, b):
+        k = ColorThief.hilo(r, g, b)
+        if ColorThief.is_white(r, g, b):
+            return (0, 0, 0)
+        elif ColorThief.is_black(r, g, b):
+            return (0xff, 0xff, 0xff)
+        return tuple(k - u for u in (r, g, b))
+    
+    @staticmethod
+    def complement_pix(pix):
+        return ColorThief.complement(pix[0], pix[1], pix[2])
+
+    def get_color(self, quality=1, no_white=True, no_black=True, dist=False):
         """Get the dominant color.
 
         :param quality: quality settings, 1 is the highest quality, the bigger
                         the number, the faster a color will be returned but
                         the greater the likelihood that it will not be the
                         visually most dominant color
+        :param no_white: ignore white pixels if True
+        :param no_black: ignore black pixels if True
+        :param dist: return pixel with its frequency if True
         :return tuple: (r, g, b)
         """
-        palette = self.get_palette(5, quality)
+        palette = self.get_palette(5, quality, no_white=no_white, no_black=no_black, dist=dist)
         return palette[0]
 
-    def get_palette(self, color_count=10, quality=10):
+    def get_palette(self, color_count=10, quality=1, no_white=True, no_black=True, dist=False):
         """Build a color palette.  We are using the median cut algorithm to
         cluster similar colors.
 
@@ -58,31 +118,48 @@ class ColorThief(object):
         :param quality: quality settings, 1 is the highest quality, the bigger
                         the number, the faster the palette generation, but the
                         greater the likelihood that colors will be missed.
-        :return list: a list of tuple in the form (r, g, b)
+        :param no_white: ignore white pixels if True
+        :param no_black: ignore black pixels if True
+        :param dist: return pixels with their distribution if True
+        :return list: a list of tuples in the (r, g, b) form
         """
-        image = self.image.convert('RGBA')
-        width, height = image.size
-        pixels = image.getdata()
-        pixel_count = width * height
+        if self.image:
+            image = self.image.convert('RGBA')
+            width, height = image.size
+            self.pixels = image.getdata()
+            pixel_count = width * height
+        else:
+            pixel_count = len(self.pixels)
         valid_pixels = []
         for i in range(0, pixel_count, quality):
-            r, g, b, a = pixels[i]
-            # If pixel is mostly opaque and not white
-            if a >= 125:
-                if not (r > 250 and g > 250 and b > 250):
+            r, g, b, a = self.pixels[i]
+            if a >= self.alpha_threshold:
+                is_white = self.is_white(r, g, b)
+                is_black = self.is_black(r, g, b)
+                if (no_white and no_black) and not (is_white or is_black):
                     valid_pixels.append((r, g, b))
+                elif no_black and not is_black:
+                    valid_pixels.append((r, g, b))
+                elif no_white and not is_white:
+                    valid_pixels.append((r, g, b))
+                elif (not no_white and not no_black):
+                    valid_pixels.append((r, g, b))
+
+        if len(valid_pixels) == 0:
+            return [self.default_color]
 
         # Send array to quantize function which clusters values
         # using median cut algorithm
-        cmap = MMCQ.quantize(valid_pixels, color_count)
-        return cmap.palette
+        self.cmap = MMCQ.quantize(valid_pixels, color_count)
+        if dist:
+            return self.cmap.palette_distribution
+        return self.cmap.palette
 
 
 class MMCQ(object):
     """Basic Python port of the MMCQ (modified median cut quantization)
     algorithm from the Leptonica library (http://www.leptonica.com/).
     """
-
     SIGBITS = 5
     RSHIFT = 8 - SIGBITS
     MAX_ITERATION = 1000
@@ -355,6 +432,11 @@ class CMap(object):
     @property
     def palette(self):
         return self.vboxes.map(lambda x: x['color'])
+
+    @property
+    def palette_distribution(self):
+        total = sum(self.vboxes.map(lambda x: x['vbox'].count))
+        return self.vboxes.map(lambda x: (x['color'], x['vbox'].count / float(total)))
 
     def push(self, vbox):
         self.vboxes.push({
